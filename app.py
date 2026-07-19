@@ -1,9 +1,11 @@
 import streamlit as st
 import joblib
+import copy
 import folium
 from streamlit_folium import st_folium
 from critical_keywords import CRITICAL_KEYWORDS
-from responder_logic import assign_responder, RESPONDERS
+from responder_logic import assign_responder, RESPONDERS as DEFAULT_RESPONDERS
+
 SURGE_INCIDENTS = [
     {"message": "building collapsed people trapped inside need urgent rescue", "lat": 19.9975, "lng": 73.7898},
     {"message": "bhai jaldi aao ghar mein aag lag gayi bachao", "lat": 20.0059, "lng": 73.7910},
@@ -14,6 +16,7 @@ SURGE_INCIDENTS = [
     {"message": "gas cylinder blast in kitchen one burned badly", "lat": 19.9850, "lng": 73.7920},
     {"message": "traffic jam due to tree fall no injuries", "lat": 20.0080, "lng": 73.7860},
 ]
+
 st.set_page_config(page_title="AI Emergency Triage", layout="wide")
 
 @st.cache_resource
@@ -28,16 +31,14 @@ if "incidents" not in st.session_state:
     st.session_state.incidents = []
 if "pending_location" not in st.session_state:
     st.session_state.pending_location = None
+if "responders" not in st.session_state:
+    st.session_state.responders = copy.deepcopy(DEFAULT_RESPONDERS)
 
 st.title("🚨 AI Emergency Triage & Response Routing")
 st.caption("Classifies incoming emergency reports and routes them to the nearest available responder — instantly.")
 
 severity_colors = {"critical": "red", "medium": "orange", "low": "green"}
 
-# ---- Report form (message + submit button, location comes from map click) ----
-st.subheader("Report an Incident")
-message = st.text_area("write an incident?", placeholder="e.g. building collapsed people trapped inside")
-st.write("📍 Click anywhere on the map below to mark the incident's location (simulates automatic GPS detection from the caller's phone), then click Submit.")
 def process_incident(message, lat, lng):
     text_vec = vectorizer.transform([message])
     prediction = model.predict(text_vec)[0]
@@ -52,7 +53,7 @@ def process_incident(message, lat, lng):
         final_severity = "critical"
         override_applied = True
 
-    assignment = assign_responder(lat, lng, final_severity)
+    assignment = assign_responder(lat, lng, final_severity, responders=st.session_state.responders)
 
     st.session_state.incidents.append({
         "message": message,
@@ -63,37 +64,21 @@ def process_incident(message, lat, lng):
         "lng": lng,
         "assignment": assignment,
     })
-btn_col1, btn_col2 = st.columns([1, 1])
-with btn_col1:
-    submit_clicked = st.button("Submit Report", type="primary")
-with btn_col2:
-    surge_clicked = st.button("🚨 Simulate Disaster Surge (8 incidents)")
 
-if surge_clicked:
-    # Reset responders to available so the surge has fresh teams to assign
-    for r in RESPONDERS:
-        r["available"] = True
-    st.session_state.incidents = []
-
-    for incident in SURGE_INCIDENTS:
-        process_incident(incident["message"], incident["lat"], incident["lng"])
-
-    st.success(f"Simulated {len(SURGE_INCIDENTS)} incoming incidents — see them classified and routed on the map below.")
-    st.rerun()
+# ---- Report form (message only — location comes from map click below) ----
+st.subheader("Report an Incident")
+message = st.text_area("What's happening?", placeholder="e.g. building collapsed people trapped inside")
+st.write("📍 Click anywhere on the map below to mark the incident's location (simulates automatic GPS detection from the caller's phone).")
 
 # ---- Build ONE combined map: past incidents + responders + click capture ----
 combined_map = folium.Map(location=[19.9975, 73.7898], zoom_start=13)
 combined_map.get_root().html.add_child(folium.Element("""
 <style>
-.leaflet-container {
-    cursor: crosshair !important;
-}
-.leaflet-grab {
-    cursor: crosshair !important;
-}
+.leaflet-container { cursor: crosshair !important; }
+.leaflet-grab { cursor: crosshair !important; }
 </style>
 """))
-# Plot all past incidents, color-coded by severity
+
 for incident in st.session_state.incidents:
     color = severity_colors.get(incident["severity"], "gray")
     folium.CircleMarker(
@@ -106,8 +91,7 @@ for incident in st.session_state.incidents:
         popup=f"{incident['severity'].upper()}: {incident['message'][:40]}",
     ).add_to(combined_map)
 
-# Plot all responder teams
-for r in RESPONDERS:
+for r in st.session_state.responders:
     status = "Available" if r["available"] else "Busy"
     folium.Marker(
         location=[r["lat"], r["lng"]],
@@ -115,7 +99,6 @@ for r in RESPONDERS:
         icon=folium.Icon(color="blue", icon="ambulance", prefix="fa"),
     ).add_to(combined_map)
 
-# If a location has already been clicked (but not yet submitted), show a temporary marker
 if st.session_state.pending_location:
     folium.Marker(
         location=[st.session_state.pending_location["lat"], st.session_state.pending_location["lng"]],
@@ -123,9 +106,14 @@ if st.session_state.pending_location:
         icon=folium.Icon(color="black", icon="exclamation", prefix="fa"),
     ).add_to(combined_map)
 
-map_output = st_folium(combined_map, height=850, width=1200, key="main_map")
+map_output = st_folium(
+    combined_map,
+    height=550,
+    width=1200,
+    key="main_map",
+    returned_objects=["last_clicked"]
+)
 
-# Capture the click and store it (so it survives until Submit is pressed)
 if map_output and map_output.get("last_clicked"):
     st.session_state.pending_location = map_output["last_clicked"]
 
@@ -134,7 +122,15 @@ if st.session_state.pending_location:
 else:
     st.warning("No location selected yet — click on the map above.")
 
-# ---- Handle submission ----
+# ---- Buttons go BELOW the map ----
+btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
+with btn_col1:
+    submit_clicked = st.button("Submit Report", type="primary")
+with btn_col2:
+    surge_clicked = st.button("🚨 Simulate Disaster Surge (8 incidents)")
+with btn_col3:
+    reset_clicked = st.button("🔄 Reset Demo")
+
 if submit_clicked:
     if not message.strip():
         st.error("Please describe what's happening.")
@@ -147,44 +143,25 @@ if submit_clicked:
         st.session_state.pending_location = None
         st.success("Incident classified and routed — check the map and log below.")
         st.rerun()
-    if not message.strip():
-        st.error("Please describe what's happening.")
-    elif not st.session_state.pending_location:
-        st.error("Please click a location on the map first.")
-    else:
-        incident_lat = st.session_state.pending_location["lat"]
-        incident_lng = st.session_state.pending_location["lng"]
 
-        text_vec = vectorizer.transform([message])
-        prediction = model.predict(text_vec)[0]
-        probabilities = model.predict_proba(text_vec)[0]
-        confidence = max(probabilities)
+if surge_clicked:
+    for r in st.session_state.responders:
+        r["available"] = True
+    st.session_state.incidents = []
 
-        message_lower = message.lower()
-        keyword_hit = any(word in message_lower for word in CRITICAL_KEYWORDS)
-        final_severity = prediction
-        override_applied = False
-        if keyword_hit and prediction != "critical":
-            final_severity = "critical"
-            override_applied = True
+    for incident in SURGE_INCIDENTS:
+        process_incident(incident["message"], incident["lat"], incident["lng"])
 
-        assignment = assign_responder(incident_lat, incident_lng, final_severity)
+    st.success(f"Simulated {len(SURGE_INCIDENTS)} incoming incidents — see them classified and routed on the map below.")
+    st.rerun()
 
-        st.session_state.incidents.append({
-            "message": message,
-            "severity": final_severity,
-            "confidence": round(float(confidence), 2),
-            "override": override_applied,
-            "lat": incident_lat,
-            "lng": incident_lng,
-            "assignment": assignment,
-        })
+if reset_clicked:
+    st.session_state.incidents = []
+    st.session_state.responders = copy.deepcopy(DEFAULT_RESPONDERS)
+    st.session_state.pending_location = None
+    st.rerun()
 
-        st.session_state.pending_location = None  # reset for next report
-        st.success(f"Classified as **{final_severity.upper()}** — assigned to {assignment['responder_id'] if assignment else 'No team available'}")
-        st.rerun()
-
-# ---- Incident log ----
+# ---- Analytics ----
 st.subheader("Response Analytics")
 
 if st.session_state.incidents:
@@ -208,6 +185,8 @@ else:
     st.info("Submit incidents to see analytics here.")
 
 st.divider()
+
+# ---- Incident log ----
 st.subheader("Incident Log")
 for incident in reversed(st.session_state.incidents):
     with st.expander(f"{incident['severity'].upper()} — {incident['message'][:50]}"):
